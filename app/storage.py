@@ -6,6 +6,7 @@
 - 发布流程：读源 -> 校验（缺片 / 训练步）-> 重分片 -> 逐片暂存并累计容量
   -> 在指定挂载条件下回读校验 -> 原子替换发布。
   任何一步失败：清理暂存、保留上次发布结果、在历史里记录原因。
+- 归档（ArchiveStore）：两个回退位，内容寻址去重；删除立即释放独占数据块。
 """
 from __future__ import annotations
 
@@ -16,6 +17,9 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
+from archive_store import ArchiveError, ArchiveStore
 from reshard import (ARRAY_KEYS, OverCapacityError, ReshardError,
                      SimulatedWriteError, SourceUnreadableError, VerifyError,
                      load_source_checkpoint, reshard_arrays, split_sizes,
@@ -209,6 +213,7 @@ class ReshardService:
         data_dir.mkdir(parents=True, exist_ok=True)
         self.old = OldVolume(data_dir)
         self.new = NewVolume(data_dir)
+        self.archive = ArchiveStore(data_dir)
         self.lock = threading.Lock()
 
     # ---- 可读性 ----
@@ -322,3 +327,102 @@ class ReshardService:
             "prev_published_bytes": published_before,
             "op_peak": op_peak,
         }
+
+    # ---- 发布数据读取 ----
+    def published_arrays(self) -> dict | None:
+        """当前发布的一套全局数组（按 rank 顺序拼接，与 rank 切法无关）。
+
+        发布结果依赖旧卷且旧卷不可读时返回 None。
+        """
+        pub = self.new.published
+        if pub is None or self.published_readable() is False:
+            return None
+        out: dict[str, list[np.ndarray]] = {k: [] for k in ARRAY_KEYS}
+        for r in range(int(pub["ranks"])):
+            path = self.new.published_root / pub["id"] / f"rank_{r}.npz"
+            if not path.is_file():
+                return None
+            with np.load(path) as z:
+                for k in ARRAY_KEYS:
+                    out[k].append(np.ascontiguousarray(z[k]).reshape(-1))
+        return {k: (np.concatenate(v) if v else np.empty(0)) for k, v in out.items()}
+
+    # ---- 归档：留两个回退位 ----
+    def archive_current(self, simulate_write_fail: bool = False) -> dict:
+        """把当前不依赖旧卷的发布存档；不改变发布本身。"""
+        with self.lock:
+            pub = self.new.published
+            op = {
+                "kind": "archive_create",
+                "time": _now(),
+                "publish_id": pub.get("id") if pub else None,
+                "simulate_write_fail": simulate_write_fail,
+            }
+            try:
+                if pub is None:
+                    raise ArchiveError("尚未发布任何结果，没有可存档的发布")
+                if pub.get("requires_old_volume"):
+                    raise ArchiveError(
+                        "当前发布依赖旧卷，不能存档；请先发布不依赖旧卷的结果")
+                arrays = self.published_arrays()
+                if arrays is None:
+                    raise ArchiveError("当前发布数据不可读，无法存档")
+                desc = self.archive.create_archive(pub, arrays, simulate_write_fail)
+            except Exception as exc:
+                op.update(status="failed", reason=str(exc))
+                self.archive.append_history(op)
+                self.archive.save()
+                raise
+            desc["store_bytes"] = self.archive.stored_bytes()
+            op.update(status="archived", archive_id=desc["id"],
+                      step=desc["step"], new_data_bytes=desc["new_data_bytes"],
+                      store_bytes=desc["store_bytes"])
+            self.archive.append_history(op)
+            self.archive.save()
+            return desc
+
+    def delete_archive(self, archive_id: str) -> dict:
+        with self.lock:
+            op = {"kind": "archive_delete", "time": _now(), "archive_id": archive_id}
+            try:
+                exclusive = self.archive.exclusive_bytes(archive_id)
+                other_used = self.archive.stored_bytes() - exclusive
+                desc = self.archive.delete_archive(archive_id)
+            except Exception as exc:
+                op.update(status="failed", reason=str(exc))
+                self.archive.append_history(op)
+                self.archive.save()
+                raise
+            self.archive.delete_exports_for(archive_id)
+            desc = dict(desc)
+            desc["freed_exclusive_bytes"] = int(exclusive)
+            desc["store_bytes"] = self.archive.stored_bytes()
+            desc["pruned"] = desc["store_bytes"] < other_used
+            op.update(status="deleted", freed_bytes=desc["freed_exclusive_bytes"],
+                      store_bytes=desc["store_bytes"], pruned=desc["pruned"])
+            self.archive.append_history(op)
+            self.archive.save()
+            return desc
+
+    def set_archive_capacity(self, capacity: int) -> None:
+        with self.lock:
+            self.archive.capacity = capacity
+
+    def export_from_archive(self, archive_id: str, n_new: int) -> dict:
+        """旧卷卸载 / 发布换版后仍可：只从所选留档读数组与训练步，重分片。"""
+        with self.lock:
+            op = {"kind": "archive_export", "time": _now(),
+                  "archive_id": archive_id, "n_new": n_new}
+            try:
+                manifest = self.archive.export_from_archive(archive_id, n_new)
+            except Exception as exc:
+                op.update(status="failed", reason=str(exc))
+                self.archive.append_history(op)
+                self.archive.save()
+                raise
+            op.update(status="exported", export_id=manifest["export_id"],
+                      step=manifest["step"], ranks=manifest["ranks"],
+                      bytes=manifest["bytes"])
+            self.archive.append_history(op)
+            self.archive.save()
+            return manifest

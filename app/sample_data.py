@@ -1,8 +1,10 @@
 """内置旧卷样例检查点。
 
-- ckpt-demo-3rank    : 3 个 rank，长度 [10, 7, 13]，step=42000，数据确定可复现
-- ckpt-step-mismatch : 2 个 rank，训练步不一致（用于演示失败保留旧发布）
-- ckpt-missing-rank  : manifest 声明 3 个 rank，缺 rank_2.npz（演示缺片）
+- ckpt-demo-3rank        : 3 个 rank，长度 [10, 7, 13]，step=42000，数据确定可复现
+- ckpt-demo-3rank-step2  : 同一份全局数组、同一 rank 切法，仅 step=43000
+                           （用于演示两个留档共享全部数组数据）
+- ckpt-step-mismatch     : 2 个 rank，训练步不一致（用于演示失败保留旧发布）
+- ckpt-missing-rank      : manifest 声明 3 个 rank，缺 rank_2.npz（演示缺片）
 """
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ import numpy as np
 from storage import OldVolume
 
 SAMPLE_VOLUME_ID = "oldvol-7f3a9c21"
+DEMO_LENGTHS = [10, 7, 13]
 
 
 def _write_rank(ckpt_dir: Path, r: int, param, m, v, step: int) -> None:
@@ -31,23 +34,41 @@ def _manifest(ckpt_dir: Path, ckpt_id: str, ranks: int, step, lengths, dtype) ->
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _build_demo(base: Path) -> None:
-    ckpt = base / "ckpt-demo-3rank"
+def _demo_arrays() -> dict:
+    """确定可复现的全局数组（3 个数组同段）。"""
+    rng = np.random.default_rng(20261123)
+    total = sum(DEMO_LENGTHS)
+    return {
+        "param": rng.standard_normal(total).astype(np.float32),
+        "adam_m": (rng.standard_normal(total) * 0.01).astype(np.float32),
+        "adam_v": (rng.random(total) * 0.001).astype(np.float32),  # 二阶状态非负
+    }
+
+
+def _build_from_global(base: Path, ckpt_id: str, step: int,
+                       lengths: list[int]) -> None:
+    ckpt = base / ckpt_id
     if (ckpt / "manifest.json").is_file():
         return
     ckpt.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(20261123)
-    lengths = [10, 7, 13]
-    total = sum(lengths)
-    param = rng.standard_normal(total).astype(np.float32)
-    m = (rng.standard_normal(total) * 0.01).astype(np.float32)
-    v = (rng.random(total) * 0.001).astype(np.float32)  # 二阶状态非负
+    arrays = _demo_arrays()
     off = 0
     for r, ln in enumerate(lengths):
-        _write_rank(ckpt, r, param[off:off + ln], m[off:off + ln],
-                    v[off:off + ln], step=42000)
+        sl = slice(off, off + ln)
+        _write_rank(ckpt, r, arrays["param"][sl], arrays["adam_m"][sl],
+                    arrays["adam_v"][sl], step=step)
         off += ln
-    _manifest(ckpt, "ckpt-demo-3rank", 3, 42000, lengths, "float32")
+    assert off == sum(DEMO_LENGTHS)
+    _manifest(ckpt, ckpt_id, len(lengths), step, lengths, "float32")
+
+
+def _build_demo(base: Path) -> None:
+    _build_from_global(base, "ckpt-demo-3rank", 42000, DEMO_LENGTHS)
+
+
+def _build_demo_step2(base: Path) -> None:
+    _build_from_global(base, "ckpt-demo-3rank-step2", 43000, DEMO_LENGTHS)
+
 
 
 def _build_step_mismatch(base: Path) -> None:
@@ -91,6 +112,7 @@ def ensure_samples(old: OldVolume) -> None:
     ckpts = old.checkpoints_dir()
     ckpts.mkdir(parents=True, exist_ok=True)
     _build_demo(ckpts)
+    _build_demo_step2(ckpts)
     _build_step_mismatch(ckpts)
     _build_missing_rank(ckpts)
     if not old.mount_file.is_file():

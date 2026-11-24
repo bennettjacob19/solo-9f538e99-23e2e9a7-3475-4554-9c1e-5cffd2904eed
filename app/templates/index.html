@@ -126,6 +126,9 @@
         <span class="hint">（发布 {{ new.published_bytes() }} B + 暂存 {{ new.staging_bytes() }} B）</span>
       </div>
       <div><b>分片文件占用峰值</b> <span class="mono">{{ new.peak_bytes }} B</span></div>
+      <div><b>归档数组数据占用</b> <span class="mono">{{ archive.used_bytes }} B</span>
+        <span class="hint">（容量 {{ archive.capacity }} B，{{ archive.slots_used }}/{{ archive.max_slots }} 位）</span>
+      </div>
     </div>
     <div class="kv" style="flex:2; min-width:320px;">
       {% if published %}
@@ -157,7 +160,115 @@
 </section>
 
 <section class="card">
-  <h2>④ 操作历史（最近 50 条）</h2>
+  <h2>④ 归档（两个回退位，内容寻址去重）</h2>
+  <div class="row">
+    <div class="kv" style="flex:1; min-width:300px;">
+      <div><b>归档容量</b> {{ archive.capacity }} B</div>
+      <div><b>数组数据占用</b> <span class="mono">{{ archive.used_bytes }} B</span>
+        {% if archive.used_bytes > archive.capacity %}<span class="badge b-err">超容量</span>{% endif %}
+        <span class="hint">入档后实际保留的数组数据字节数（去重后，不含索引元数据）</span>
+      </div>
+      <div><b>回退位</b> {{ archive.slots_used }} / {{ archive.max_slots }} 已用</div>
+      <form method="post" action="/archive/capacity">
+        <label>归档容量（字节）</label>
+        <input type="number" name="archive_capacity" min="0" value="{{ archive.capacity }}" required>
+        <p><button type="submit">保存归档容量</button>
+          <span class="hint">只改容量，已有留档与占用照旧。</span></p>
+      </form>
+      <form method="post" action="/archive">
+        <p><button class="primary" type="submit"
+          {% if not published or published.requires_old_volume or archive.slots_used >= archive.max_slots %}disabled{% endif %}>
+          将当前发布存档</button>
+          <label><input type="checkbox" name="simulate_write_fail" style="width:auto;"> 模拟归档写失败</label></p>
+        <p class="hint">只可存档当前不依赖旧卷的发布；仅训练步或 rank 切法不同的两版共享全部数组数据。
+          超额或写失败时，已有留档和占用保持不变。</p>
+      </form>
+    </div>
+    <div style="flex:2; min-width:360px;">
+      {% if archive.archives %}
+      <table>
+        <tr><th>留档</th><th>训练步 / 来源</th><th>数组</th><th>本次新增数据</th>
+            <th>独占（删档释放）</th><th>操作</th></tr>
+        {% for a in archive.archives %}
+        <tr>
+          <td class="mono">{{ a.id }}<br><span class="hint">{{ a.created_at }}</span></td>
+          <td>step {{ a.step }}<br><span class="hint">{{ a.source_ckpt }} / {{ a.source_ranks }} rank</span></td>
+          <td>{{ a.total_elems }} elem × 3<br>
+            <span class="hint">{{ a.logical_array_bytes }} B 原始</span></td>
+          <td class="mono">{{ a.new_data_bytes }} B</td>
+          <td class="mono">{{ a.exclusive_bytes }} B</td>
+          <td>
+            <form class="inline" method="post" action="/archive/delete"
+                  onsubmit="return confirm('删除留档 {{ a.id }}？');">
+              <input type="hidden" name="archive_id" value="{{ a.id }}">
+              <button type="submit">删除</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+      <p class="hint">删档立即释放“独占”一列的数据块；保留留档无需重写，只从所选留档读取。</p>
+      {% else %}
+      <p class="hint">暂无留档。先发布一个不依赖旧卷的结果，再存档。</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <hr style="border:0; border-top:1px solid var(--line); margin:16px 0;">
+  <h2 style="font-size:14px;">从留档在线重分片（旧卷卸载 / 当前发布换版后仍可用）</h2>
+  <form method="post" action="/archive/export" class="row" style="align-items:flex-end;">
+    <div>
+      <label>选择留档</label>
+      <select name="archive_id" {% if not archive.archives %}disabled{% endif %}>
+        {% for a in archive.archives %}
+        <option value="{{ a.id }}">{{ a.id }}（step {{ a.step }}，{{ a.total_elems }} elem）</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label>新 rank 数</label>
+      <input type="number" name="n_new" min="1" value="4" required style="width:120px;">
+    </div>
+    <div>
+      <button class="primary" type="submit" {% if not archive.archives %}disabled{% endif %}>从留档重分片并生成下载</button>
+    </div>
+  </form>
+  {% if latest_export %}
+  <div class="kv" style="margin-top:10px;">
+    <div><b>最近一次导出</b> <span class="mono">{{ latest_export.export_id }}</span>
+      来自 <span class="mono">{{ latest_export.source_archive_id }}</span>，
+      {{ latest_export.ranks }} 个分片 / step {{ latest_export.step }} / {{ latest_export.bytes }} B</div>
+    <div><b>下载</b>
+      {% for r in range(latest_export.ranks) %}
+      <a class="btn" href="/archive/download/{{ latest_export.export_id }}/{{ r }}">rank_{{ r }}.npz</a>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+  {% if archive_history %}
+  <details style="margin-top:10px;">
+    <summary class="hint">归档操作记录（最近 {{ archive_history|length }} 条）</summary>
+    <table style="margin-top:8px;">
+      <tr><th>时间</th><th>操作</th><th>结果</th><th>说明</th></tr>
+      {% for h in archive_history %}
+      <tr>
+        <td class="mono">{{ h.time }}</td>
+        <td>{{ h.kind }}</td>
+        <td>{% if h.status == 'failed' %}<span class="badge b-err">失败</span>
+            {% else %}<span class="badge b-ok">{{ h.status }}</span>{% endif %}</td>
+        <td>{% if h.status == 'failed' %}{{ h.reason }}
+            {% elif h.kind == 'archive_create' %}新增 {{ h.new_data_bytes }} B，占用 {{ h.store_bytes }} B
+            {% elif h.kind == 'archive_delete' %}释放 {{ h.freed_bytes }} B，占用 {{ h.store_bytes }} B
+            {% else %}{{ h.ranks }} 个分片 / step {{ h.step }} / {{ h.bytes }} B{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </details>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>⑤ 操作历史（最近 50 条）</h2>
   <table>
     <tr><th>时间</th><th>检查点</th><th>新 rank</th><th>容量 B</th><th>依赖旧卷</th><th>结果</th><th>峰值 B / 失败原因</th></tr>
     {% for h in history %}

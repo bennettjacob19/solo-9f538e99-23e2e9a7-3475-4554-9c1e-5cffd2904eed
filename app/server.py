@@ -1,18 +1,25 @@
 """Flask 入口：检查点重分片网页。
 
 路由：
-  GET  /                 状态页（旧卷 / 新卷 / 发布结果 / 历史）
+  GET  /                 状态页（旧卷 / 新卷 / 发布结果 / 归档 / 历史）
   POST /mount            模拟卸载、挂回同一卷、挂载不同卷
   POST /reshard          选检查点 + 新 rank 数 + 新卷容量 -> 重分片并发布
   GET  /download/<rank>  按新 rank 下载已发布的 npz 分片
+  POST /archive/capacity 设置归档容量（字节）
+  POST /archive          把当前不依赖旧卷的发布存入回退位（两个位）
+  POST /archive/delete   删除任一留档（立即释放独占数组数据）
+  POST /archive/export   选留档 + 新 rank 数，仅从该留档重分片并生成下载
+  GET  /archive/download/<export_id>/<rank>  下载留档重分片结果
 """
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-from flask import Flask, abort, flash, redirect, render_template, request, send_file
+from flask import (Flask, abort, flash, redirect, render_template, request,
+                   send_file)
 
+from archive_store import ArchiveError
 from sample_data import ensure_samples
 from storage import ReshardService
 
@@ -40,6 +47,9 @@ def create_app() -> Flask:
             readable=readable,
             usage=service.new.usage_bytes(),
             history=list(reversed(service.new.history)),
+            archive=service.archive.page_stats(),
+            archive_history=list(reversed(service.archive.history)),
+            latest_export=service.archive.latest_export(),
         )
 
     @app.post("/mount")
@@ -104,6 +114,91 @@ def create_app() -> Flask:
             abort(404, description="分片文件缺失")
         return send_file(path, as_attachment=True,
                          download_name=f"{pub['id']}_rank_{rank}.npz")
+
+    # ---- 归档容量 ----
+    @app.post("/archive/capacity")
+    def archive_capacity():
+        try:
+            capacity = int(request.form.get("archive_capacity", ""))
+        except ValueError:
+            flash("归档容量必须是整数。", "err")
+            return redirect("/")
+        try:
+            service.set_archive_capacity(capacity)
+        except ArchiveError as exc:
+            flash(f"归档容量未修改：{exc}", "err")
+        else:
+            flash(f"归档容量已设为 {capacity} B（已保留的数据不删）。", "ok")
+        return redirect("/")
+
+    # ---- 存留档 ----
+    @app.post("/archive")
+    def archive_create():
+        try:
+            desc = service.archive_current(
+                simulate_write_fail=request.form.get("simulate_write_fail") == "on",
+            )
+        except ArchiveError as exc:
+            flash(f"存档失败：{exc}。已有留档与占用保持不变。", "err")
+        else:
+            flash(
+                f"已存档 {desc['id']}：训练步 {desc['step']}，"
+                f"新增数组数据 {desc['new_data_bytes']} B，"
+                f"数组数据占用 {desc['store_bytes']} B"
+                f"（{service.archive.page_stats()['slots_used']}/2 位）。",
+                "ok",
+            )
+        return redirect("/")
+
+    # ---- 删留档 ----
+    @app.post("/archive/delete")
+    def archive_delete():
+        archive_id = request.form.get("archive_id", "")
+        try:
+            desc = service.delete_archive(archive_id)
+        except ArchiveError as exc:
+            flash(f"删除失败：{exc}。已有留档与占用保持不变。", "err")
+        else:
+            extra = "" if desc["pruned"] else (
+                "（有留档索引异常，已跳过清理以免误删共享数据；刷新后重试）")
+            flash(
+                f"已删除留档 {desc['id']}：释放仅该档使用的数组数据 "
+                f"{desc['freed_exclusive_bytes']} B，数组数据占用 {desc['store_bytes']} B。"
+                + extra,
+                "ok",
+            )
+        return redirect("/")
+
+    # ---- 从留档重分片导出 ----
+    @app.post("/archive/export")
+    def archive_export():
+        archive_id = request.form.get("archive_id", "")
+        try:
+            n_new = int(request.form.get("n_new", ""))
+        except ValueError:
+            flash("新 rank 数必须是整数。", "err")
+            return redirect("/")
+        try:
+            manifest = service.export_from_archive(archive_id, n_new)
+        except ArchiveError as exc:
+            flash(f"从留档重分片失败：{exc}", "err")
+        else:
+            flash(
+                f"已从留档 {manifest['source_archive_id']} 重分片："
+                f"{manifest['ranks']} 个分片，训练步 {manifest['step']}，"
+                f"下载文件共 {manifest['bytes']} B（不读旧卷、不读当前发布）。",
+                "ok",
+            )
+        return redirect("/")
+
+    @app.get("/archive/download/<export_id>/<int:rank>")
+    def archive_download(export_id: str, rank: int):
+        found = service.archive.export_file(export_id, rank)
+        if found is None:
+            abort(404, description="导出结果不存在或 rank 超出范围")
+        path, manifest = found
+        return send_file(path, as_attachment=True,
+                         download_name=f"{manifest['export_id']}_rank_{rank}.npz")
 
     return app
 
